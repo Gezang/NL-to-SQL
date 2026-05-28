@@ -39,15 +39,15 @@ The default model is `bilstm`. Test-set predictions are written to the `results/
 
 ## Results
 
-All models are evaluated on the dev set. The headline metric is **Complete SQL Accuracy** (the full predicted query, template plus filled-in variables, matches the reference exactly).
+All models are evaluated on the dev set and use a fixed random seed, so the numbers below are reproducible. The headline metric is **Complete SQL Accuracy** (the full predicted query, template plus filled-in variables, matches the reference exactly).
 
 | Model  | Complete SQL Accuracy | Template Accuracy | Tag Accuracy |
 | ------ | --------------------- | ----------------- | ------------ |
 | Linear | 40.8%                 | 51.0%             | 97.4%        |
-| LSTM   | 46.9%                 | 49.0%             | 99.2%        |
-| BiLSTM | 51.0%                 | 53.1%             | 99.2%        |
+| LSTM   | 42.9%                 | 44.9%             | 98.4%        |
+| BiLSTM | 51.0%                 | 51.0%             | 99.7%        |
 
-The BiLSTM performs best on full SQL prediction (~51% vs ~46% for the LSTM and ~40% for the linear baseline), as expected: bidirectional context lets the model condition each token's tag on both the preceding and following words, which helps both template selection and variable tagging.
+The BiLSTM performs best on full SQL prediction (~51% vs ~43% for the LSTM and ~41% for the linear baseline), as expected: bidirectional context lets the model condition each token's tag on both the preceding and following words, which helps both template selection and variable tagging.
 
 ## Future Work
 

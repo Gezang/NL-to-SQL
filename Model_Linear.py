@@ -1,27 +1,8 @@
-import json
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
 
-
-def read_data(filename):
-    with open(filename, "r") as f:
-        raw_data = json.load(f)
-    data = []
-    for entry in raw_data:
-        template = sorted(entry["sql"], key=lambda x: (len(x), x))[0]
-        for sentence in entry["sentences"]:
-            tokens = sentence["text"].split()
-            tags = ["O"] * len(tokens)
-            complete = template
-            for variable, value in sentence["variables"].items():
-                idx = tokens.index(variable)
-                value_tokens = value.split()
-                tokens = tokens[:idx] + value_tokens + tokens[idx + 1:]
-                tags = tags[:idx] + [variable] * len(value_tokens) + tags[idx + 1:]
-                complete = complete.replace(variable, value)
-            data.append({"input": tokens, "tags": tags, "template": template, "complete": complete})
-    return data
+from data import set_seed, read_data
 
 
 class DataProcessor:
@@ -136,6 +117,8 @@ def linear_model():
     print("=" * 60)
     print("  Linear Model")
     print("=" * 60)
+
+    set_seed()
 
     train_data = read_data("data/geography.train.json")
     dev_data = read_data("data/geography.dev.json")

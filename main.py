@@ -1,8 +1,7 @@
 import argparse
 
 from Model_Linear import linear_model
-from ModelLSTM import main_lstm
-from ModelBiLSTM import main_bilstm
+from model_lstm import main_lstm, main_bilstm
 
 MODELS = {
     "linear": linear_model,

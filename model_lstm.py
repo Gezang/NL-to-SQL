@@ -1,105 +1,44 @@
-import json
-from collections import Counter
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 import torch
 
-
-def read_data(filename):
-    with open(filename, "r") as f:
-        raw_data = json.load(f)
-    data = []
-    for entry in raw_data:
-        template = sorted(entry["sql"], key=lambda x: (len(x), x))[0]
-        for sentence in entry["sentences"]:
-            tokens = sentence["text"].split()
-            tags = ["O"] * len(tokens)
-            complete = template
-            for variable, value in sentence["variables"].items():
-                idx = tokens.index(variable)
-                value_tokens = value.split()
-                tokens = tokens[:idx] + value_tokens + tokens[idx + 1:]
-                tags = tags[:idx] + [variable] * \
-                    len(value_tokens) + tags[idx + 1:]
-                complete = complete.replace(variable, value)
-            data.append({"input": tokens, "tags": tags,
-                        "template": template, "complete": complete})
-    return data
+from data import (set_seed, read_data, get_features, build_vocab, encode,
+                  collate_fn, SQLDataset)
 
 
-def get_features(data):
-    X, tags, templates, complete = [], [], [], []
-    for item in data:
-        X.append(item["input"])
-        tags.append(item["tags"])
-        templates.append(item["template"])
-        complete.append(item["complete"])
-    return X, tags, templates, complete
+class LSTMTagger(nn.Module):
+    """Sequence-labelling model with two heads (per-word tags and SQL template).
 
+    Setting ``bidirectional=True`` makes it a BiLSTM; otherwise a plain LSTM.
+    """
 
-def build_vocab(sentences, min_freq=1):
-    counter = Counter(word for sentence in sentences for word in sentence)
-    special_tokens = ["<PAD>", "<UNK>"]
-    words = [w for w, c in counter.items() if c >= min_freq]
-    return {token: idx for idx, token in enumerate(special_tokens + words)}
-
-
-def encode(sentence, vocab):
-    if not isinstance(sentence, list):
-        sentence = sentence.split()
-    return [vocab.get(token, vocab["<UNK>"]) for token in sentence]
-
-
-def collate_fn(batch):
-    sentences, tags, templates = zip(*batch)
-    sentences_padded = pad_sequence(
-        sentences, batch_first=True, padding_value=0)
-    tags_padded = pad_sequence(tags, batch_first=True, padding_value=-1)
-    return sentences_padded, tags_padded, torch.stack(templates)
-
-
-class SQLDataset(Dataset):
-    def __init__(self, sentences, tags, templates, vocab, tag2idx, temp2idx):
-        self.sentences = sentences
-        self.tags = tags
-        self.templates = templates
-        self.vocab = vocab
-        self.tag2idx = tag2idx
-        self.temp2idx = temp2idx
-
-    def __len__(self):
-        return len(self.sentences)
-
-    def __getitem__(self, idx):
-        sentence = torch.tensor(encode(self.sentences[idx], self.vocab))
-        tags = torch.tensor([self.tag2idx[t] for t in self.tags[idx]])
-        template = torch.tensor(self.temp2idx[self.templates[idx]])
-        return sentence, tags, template
-
-
-class BiLSTMModel(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_tags, num_templates):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers,
+                 num_tags, num_templates, bidirectional=False, dropout=0.0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim,
-                            num_layers, batch_first=True, bidirectional=True)
-        # outputs are 2*hidden_dim because forward and backward are concatenated
-        self.fc_tag = nn.Linear(2 * hidden_dim, num_tags)
-        self.fc_sql = nn.Linear(2 * hidden_dim, num_templates)
-        self.dropout = nn.Dropout(p=0.3)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers,
+                            batch_first=True, bidirectional=bidirectional)
+        # The tag/template heads read from num_directions * hidden_dim because
+        # forward and backward states are concatenated when bidirectional.
+        out_dim = self.num_directions * hidden_dim
+        self.fc_tag = nn.Linear(out_dim, num_tags)
+        self.fc_sql = nn.Linear(out_dim, num_templates)
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
-        # 2*num_layers because bidirectional has forward + backward per layer
-        h0 = torch.zeros(2 * self.num_layers, x.size(
-            0), self.hidden_dim, device=x.device)
-        c0 = torch.zeros(2 * self.num_layers, x.size(
-            0), self.hidden_dim, device=x.device)
+        num_states = self.num_directions * self.num_layers
+        h0 = torch.zeros(num_states, x.size(0), self.hidden_dim, device=x.device)
+        c0 = torch.zeros_like(h0)
         out, (hn, _) = self.lstm(self.dropout(self.embedding(x)), (h0, c0))
-        # hn[-2] = last forward layer, hn[-1] = last backward layer
-        final_hidden = torch.cat((hn[-2], hn[-1]), dim=-1)
+        if self.bidirectional:
+            # hn[-2] = last forward layer, hn[-1] = last backward layer.
+            final_hidden = torch.cat((hn[-2], hn[-1]), dim=-1)
+        else:
+            final_hidden = hn[-1]
         return self.fc_tag(self.dropout(out)), self.fc_sql(self.dropout(final_hidden))
 
 
@@ -168,8 +107,8 @@ def evaluate_all(model, dev_sentences, tags_dev, templates_dev, complete_dev,
 
 
 def train(model, dataloader, optimizer, criterion_tags, criterion_template,
-          num_epochs, device, dev_sentences, tags_dev, templates_dev, complete_dev,
-          vocab, idx2tag, idx2template):
+          num_epochs, device, template_loss_weight, dev_sentences, tags_dev,
+          templates_dev, complete_dev, vocab, idx2tag, idx2template):
     model.to(device)
 
     for epoch in range(num_epochs):
@@ -186,7 +125,7 @@ def train(model, dataloader, optimizer, criterion_tags, criterion_template,
             loss_tags = criterion_tags(
                 per_word_preds.view(-1, model.fc_tag.out_features), tags.view(-1))
             loss_template = criterion_template(template_pred, templates)
-            loss = loss_tags + 10 * loss_template
+            loss = loss_tags + template_loss_weight * loss_template
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -208,10 +147,14 @@ def train(model, dataloader, optimizer, criterion_tags, criterion_template,
               f"Val: {complete_acc:.4f}")
 
 
-def main_bilstm():
+def run_lstm(bidirectional, embedding_dim, hidden_dim, num_layers, dropout,
+             template_loss_weight, num_epochs, batch_size, lr,
+             predictions_path, title):
     print("=" * 60)
-    print("  BiLSTM Model")
+    print(f"  {title}")
     print("=" * 60)
+
+    set_seed()
 
     train_data = read_data("data/geography.train.json")
     dev_data = read_data("data/geography.dev.json")
@@ -231,26 +174,30 @@ def main_bilstm():
     train_dataset = SQLDataset(
         x_train, tags_train, templates_train, vocab, tag2idx, temp2idx)
     train_loader = DataLoader(
-        train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BiLSTMModel(
+    model = LSTMTagger(
         vocab_size=len(vocab),
-        embedding_dim=512*2,
-        hidden_dim=512*2,
-        num_layers=2,
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
         num_tags=len(tag2idx),
         num_templates=len(temp2idx),
+        bidirectional=bidirectional,
+        dropout=dropout,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion_tags = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_template = nn.CrossEntropyLoss()
 
     dev_sentences = [" ".join(x) for x in x_dev]
     train(model, train_loader, optimizer, criterion_tags, criterion_template,
-          num_epochs=25, device=device, dev_sentences=dev_sentences,
-          tags_dev=tags_dev, templates_dev=templates_dev, complete_dev=complete_dev,
+          num_epochs=num_epochs, device=device,
+          template_loss_weight=template_loss_weight,
+          dev_sentences=dev_sentences, tags_dev=tags_dev,
+          templates_dev=templates_dev, complete_dev=complete_dev,
           vocab=vocab, idx2tag=idx2tag, idx2template=idx2template)
 
     complete_acc, template_acc, tag_acc = evaluate_all(
@@ -268,6 +215,38 @@ def main_bilstm():
     test_sentences = [line.strip() for line in open("data/test.txt")]
     complete_sql = predict_complete(
         model, test_sentences, vocab, idx2tag, idx2template, device)
-    with open("results/predictions_bilstm.txt", "w") as f:
+    with open(predictions_path, "w") as f:
         for sent, sql in zip(test_sentences, complete_sql):
             f.write(sent + "|" + sql + "\n")
+
+
+def main_lstm():
+    run_lstm(
+        bidirectional=False,
+        embedding_dim=512,
+        hidden_dim=512,
+        num_layers=1,
+        dropout=0.0,
+        template_loss_weight=5,
+        num_epochs=25,
+        batch_size=32,
+        lr=0.001,
+        predictions_path="results/predictions_lstm.txt",
+        title="LSTM Model",
+    )
+
+
+def main_bilstm():
+    run_lstm(
+        bidirectional=True,
+        embedding_dim=512 * 2,
+        hidden_dim=512 * 2,
+        num_layers=2,
+        dropout=0.3,
+        template_loss_weight=10,
+        num_epochs=25,
+        batch_size=32,
+        lr=0.001,
+        predictions_path="results/predictions_bilstm.txt",
+        title="BiLSTM Model",
+    )
