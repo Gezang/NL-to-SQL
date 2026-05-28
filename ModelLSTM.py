@@ -263,6 +263,6 @@ def main_lstm():
     test_sentences = [line.strip() for line in open("data/test.txt")]
     complete_sql = predict_complete(
         model, test_sentences, vocab, idx2tag, idx2template, device)
-    with open("q5_predictions.txt", "w") as f:
+    with open("results/predictions_lstm.txt", "w") as f:
         for sent, sql in zip(test_sentences, complete_sql):
             f.write(sent + "|" + sql + "\n")

@@ -146,6 +146,6 @@ def linear_model():
 
     test_sentences = [line.strip() for line in open("data/test.txt")]
     complete_sql = model.predict_complete_sql(test_sentences)
-    with open("q4_predictions.txt", "w") as f:
+    with open("results/predictions_linear.txt", "w") as f:
         for sent, sql in zip(test_sentences, complete_sql):
             f.write(sent + "|" + sql + "\n")
